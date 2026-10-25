@@ -79,6 +79,24 @@ def _is_session_expired(resp: dict[str, Any], ret: Any, errcode: Any) -> bool:
     return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg") or resp.get("msg"))
 
 
+def _is_transport_failure(exc: BaseException) -> bool:
+    """True when the failure says the connection itself is broken (connect/DNS/TLS/timeout).
+
+    API-level answers (``ret``/``errcode``, HTTP 4xx/5xx RuntimeError) do not condemn the session: the
+    peer answered. Connector errors can arrive wrapped, so the cause chain is inspected too.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        if aiohttp is not None and isinstance(current, (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError)):
+            return True
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> RuntimeError:
     """The stale-session ``-2`` after the tokenless re-send is exhausted (or with no token to drop): iLink will not
     prepare a bot-initiated send until this peer messages the bot again. Deterministic, so it is neither retried nor
@@ -870,6 +888,27 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] old poll session close failed: %s", self.name, exc)
 
+    async def _recycle_send_session(self, *, stale: Optional[aiohttp.ClientSession] = None) -> None:
+        """Swap in a fresh ``_send_session`` *then* close the old one.
+
+        A send connector that dies across a network blip or a local proxy can strand its sockets: every later
+        send on the same session then fails with ``Cannot connect to host ... ssl:default`` until the process
+        restarts. Closing the old connector releases them so the next attempt starts from zero sockets, the
+        same recovery the poll session already gets (#79889). ``stale`` lets concurrent callers recycle only
+        the session that actually failed.
+        """
+        if not self._running or aiohttp is None:
+            return
+        if stale is not None and self._send_session is not stale:
+            return
+        old, self._send_session = self._send_session, _new_session(
+            timeout=aiohttp.ClientTimeout(total=None, connect=None, sock_connect=None, sock_read=None))
+        if old is not None and not old.closed:
+            try:
+                await old.close()
+            except Exception as exc:
+                logger.debug("[%s] old send session close failed: %s", self.name, exc, exc_info=True)
+
     async def _process_message_safe(self, message: dict[str, Any]) -> None:
         try:
             await self._process_message(message)
@@ -986,9 +1025,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             while True:
                 if self._rate_limit_cooldown_remaining() > 0:
                     raise RuntimeError(f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
+                session = self._send_session
                 try:
                     resp = await _send_message(
-                        self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=chunk,
+                        session, base_url=self._base_url, token=self._token, to=chat_id, text=chunk,
                         context_token=context_token, client_id=client_id)
                     ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
@@ -1023,6 +1063,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     return
                 except Exception as exc:
                     last_error = exc
+                    if _is_transport_failure(exc):
+                        await self._recycle_send_session(stale=session)
                     if attempt >= self._send_chunk_retries:
                         break
                     attempt += 1
@@ -1113,6 +1155,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         try:
             return SendResult(success=True, message_id=await self._send_file(chat_id, path, caption, **kwargs))
         except Exception as exc:
+            if _is_transport_failure(exc):
+                await self._recycle_send_session()
             logger.error("[%s] %s failed to=%s: %s", self.name, label, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
